@@ -13,13 +13,13 @@
 
         <meta name="author" content="David Higgins" />
         <meta name="keywords" content="software,python,django" />
-        <meta name="description" content="A look at how I implemented and supported dynamic database configuration and model insertion into a running django instance." />
+        <meta name="description" content="A walk through of how I implemented the ability to dynamically add database configurations and subsequent connections to a running Django instance. Along with dynamically creating model classes to access the tables of the added connections." />
 
         <meta property="og:site_name" content="sligodave.com" />
         <meta property="og:type" content="article"/>
         <meta property="og:title" content="Dynamic Databases and Models in Django"/>
         <meta property="og:url" content="http://sligodave.com/dynamic-databases-and-models-in-django-EN.html"/>
-        <meta property="og:description" content="A look at how I implemented and supported dynamic database configuration and model insertion into a running django instance."/>
+        <meta property="og:description" content="A walk through of how I implemented the ability to dynamically add database configurations and subsequent connections to a running Django instance. Along with dynamically creating model classes to access the tables of the added connections."/>
         <meta property="article:published_time" content="2016-07-23" />
             <meta property="article:section" content="Software" />
             <meta property="article:tag" content="software" />
@@ -110,246 +110,320 @@ sligodave.com            </a>
     
 </footer><!-- /.post-info -->                    </div>
                 </div>
-                <p>I wanted to write a django project that allowed me to explore the data contained in some database tables that were not managed by Django.
-I had a few problems though.</p>
-<ol>
-<li>Although the keys and main columns of the tables were unlikely to change, the tables could be updated in other ways over time. So columns could get added, remove or altered.</li>
-<li>I wanted the site to have the ability to be dynamically pointed at different deployments of the same database server. For example, I wanted the one site to be able to be pointed at the production, test or developement deployment of the database. Each environment might also have a slightly different version of the database and it's tables.</li>
-</ol>
-<p>So there I was. How would I suppord the ability to add environments on the fly as more were created for testing or development etc and how also could I support the ever changing schema's of the tables?</p>
-<p>I knew I had two huge problems to confront. I had to figure out how to inject a new database's configuration into django as it was running. I also had to figure out how to query said database's for their tables and generate models of them also on the fly. I may have sat back and pondered that one for a few minutes.</p>
-<p>After a lot of digging around, I decided that I was nuts and just went looking for non django solutions.</p>
-<h1>PeeWee</h1>
-<p>I first tried PeeWee. It's a great light ORM and I have to say I really enjoyed using it. It did a great job connecting and using playhouse I was able to inspect the tables and access them as I went. It had some downsides to it though but those may have been down to my inexperience using it.</p>
-<p>I can't fully remember why but I had to specifically set the name of the table on the table model. Also whenever I hit a table with more than one field for it's primary key, I had to unset the primary key flag on all fields in a table and allow the composite mechanism to be used.</p>
-<p>I achieved these two steps by monkey patching the code. Fragile isn't the work for it and I think I may have died inside a little too.
-As I write this, for the life of me I can't think of why I didn't fork the code and just tweak it. I'm going to go with the fact that I just wanted to get it working first before I committed to it. Lets just go with that.</p>
-<p>Anyway, here's a look at what I did to monkey patch to get things going:</p>
-<div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">playhouse.reflection</span> <span class="kn">import</span> <span class="n">Introspector</span><span class="p">,</span> <span class="n">UnknownField</span>
-<span class="kn">from</span> <span class="nn">peewee</span> <span class="kn">import</span> <span class="n">Model</span><span class="p">,</span> <span class="n">PrimaryKeyField</span><span class="p">,</span> <span class="n">CompositeKey</span><span class="p">,</span> <span class="n">BareField</span><span class="p">,</span> <span class="n">DoesNotExist</span>
-<span class="kn">import</span> <span class="nn">pwiz</span>
-<span class="c1">########################################################################</span>
-<span class="c1"># Monkey Patch Introspector</span>
-<span class="c1"># Get the code</span>
-<span class="n">code</span> <span class="o">=</span> <span class="s1">&#39;&#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">inspect</span><span class="o">.</span><span class="n">getsourcelines</span><span class="p">(</span><span class="n">Introspector</span><span class="o">.</span><span class="n">generate_models</span><span class="p">)[</span><span class="mi">0</span><span class="p">])</span>
-<span class="c1"># Outdent it one step</span>
-<span class="n">code</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">sub</span><span class="p">(</span><span class="s1">r&#39;\n    &#39;</span><span class="p">,</span> <span class="s1">&#39;</span><span class="se">\n</span><span class="s1">&#39;</span><span class="p">,</span> <span class="n">code</span><span class="p">[</span><span class="mi">4</span><span class="p">:])</span>
-<span class="c1"># Insert the name of the table for the model class</span>
-<span class="n">code</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">sub</span><span class="p">(</span>
-    <span class="s1">r&#39;indexes = multi_column_indexes&#39;</span><span class="p">,</span>
-    <span class="s1">&#39;indexes = multi_column_indexes</span><span class="se">\n</span><span class="s1">            db_table = table&#39;</span><span class="p">,</span>
-    <span class="n">code</span>
-<span class="p">)</span>
-<span class="c1"># Create dict to store new to old column name mappings</span>
-<span class="n">code</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">sub</span><span class="p">(</span>
-    <span class="s1">r&#39;        primary_keys = \[\]&#39;</span><span class="p">,</span>
-    <span class="sd">&#39;&#39;&#39;        primary_keys = []</span>
-<span class="sd">        name_to_db_column_map = {}&#39;&#39;&#39;</span><span class="p">,</span>
-    <span class="n">code</span>
-<span class="p">)</span>
-<span class="c1"># Store all the original names for the columns</span>
-<span class="n">code</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">sub</span><span class="p">(</span>
-    <span class="s1">r&#39;                primary_keys.append\(column.name\)&#39;</span><span class="p">,</span>
-    <span class="sd">&#39;&#39;&#39;                primary_keys.append(column.name)</span>
-<span class="sd">                name_to_db_column_map[column.name] = column.db_column&#39;&#39;&#39;</span><span class="p">,</span>
-    <span class="n">code</span>
-<span class="p">)</span>
-<span class="c1"># Unset all fields as primary keys when we have more than one primary key field</span>
-<span class="n">code</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">sub</span><span class="p">(</span>
-    <span class="s1">r&#39;            Meta.primary_key = CompositeKey\(\[&#39;</span><span class="p">,</span>
-    <span class="sd">&#39;&#39;&#39;            for field_name in primary_keys:</span>
-<span class="sd">                database.columns[table][name_to_db_column_map[field_name]].primary_key = False</span>
-<span class="sd">            Meta.primary_key = CompositeKey([&#39;&#39;&#39;</span><span class="p">,</span>
-    <span class="n">code</span>
-<span class="p">)</span>
-<span class="c1"># Set the method on the class to our new version</span>
-<span class="n">code</span> <span class="o">=</span> <span class="s1">&#39;{}</span><span class="se">\n</span><span class="s1">Introspector.generate_models = generate_models&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">code</span><span class="p">)</span>
-<span class="k">exec</span><span class="p">(</span><span class="n">code</span><span class="p">)</span>
-<span class="c1">########################################################################</span>
-</pre></div>
+                <p>I recently found myself working on an internal site to aid developers when working across deployments of the same databases but in different environments. For example the same set of databases in a production, testing and development environment.</p>
+<p>I wanted to give a user the ability to select which environment they wanted to work against and then be able to automatically allow for subtle differences in their table structures where new features may be present in one environment but not in another.</p>
+<p>I decided that in order to achieve this, I had to firstly store configurations for database connections but in a dynamic manner where the configurations could be added and removed as needed.</p>
+<p>So I went with a basic model to represent a database connection.</p>
+<div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">__future__</span> <span class="kn">import</span> <span class="n">unicode_literals</span>
 
-
-<p>I created a python file to hold the above code and then also the class I would use to access a database on a server and it's tables there in.
-Here's the rest of that python file:</p>
-<div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">DynamicDb</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
-    <span class="k">def</span> <span class="nf">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">database_type</span><span class="p">,</span> <span class="n">database_name</span><span class="p">,</span> <span class="n">separator</span><span class="o">=</span><span class="bp">None</span><span class="p">,</span> <span class="o">**</span><span class="n">database_kwargs</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">database_type</span> <span class="o">=</span> <span class="n">database_type</span>  <span class="c1"># mysql etc...</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">database_name</span> <span class="o">=</span> <span class="n">database_name</span>  <span class="c1"># Default database to use if none are supplied at call time</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">separator</span> <span class="o">=</span> <span class="n">separator</span>  <span class="c1"># Custom field to allow me to access different</span>
-                                    <span class="c1"># databases with one database server connection</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">database_kwargs</span> <span class="o">=</span> <span class="n">database_kwargs</span>  <span class="c1"># Other variables to pass to the db connection</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">introspectors</span> <span class="o">=</span> <span class="p">{}</span>  <span class="c1"># Where I stored the previously attained model classes</span>
-
-    <span class="k">def</span> <span class="nf">get_introspector</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">database_name</span><span class="p">):</span>
-        <span class="c1"># Each database on a server got it&#39;s own introspector</span>
-        <span class="k">if</span> <span class="n">database_name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">introspectors</span><span class="p">:</span>
-            <span class="c1"># Create it if we haven&#39;t already done so</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">introspectors</span><span class="p">[</span><span class="n">database_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">pwiz</span><span class="o">.</span><span class="n">make_introspector</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">database_type</span><span class="p">,</span> <span class="n">database_name</span><span class="p">,</span> <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">database_kwargs</span>
-            <span class="p">)</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">introspectors</span><span class="p">[</span><span class="n">database_name</span><span class="p">]</span>
-
-    <span class="k">def</span> <span class="nf">get_models</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">table_names</span><span class="o">=</span><span class="bp">None</span><span class="p">,</span> <span class="n">database_name</span><span class="o">=</span><span class="bp">None</span><span class="p">):</span>
-        <span class="c1"># Get a list of all or some models for their tables from a database</span>
-        <span class="n">database_name</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">database_name</span> <span class="k">if</span> <span class="n">database_name</span> <span class="ow">is</span> <span class="bp">None</span> <span class="k">else</span> <span class="n">database_name</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_introspector</span><span class="p">(</span><span class="n">database_name</span><span class="p">)</span><span class="o">.</span><span class="n">generate_models</span><span class="p">(</span><span class="n">table_names</span><span class="o">=</span><span class="n">table_names</span><span class="p">)</span>
-
-    <span class="k">def</span> <span class="nf">get_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">table_name</span><span class="p">,</span> <span class="n">database_name</span><span class="o">=</span><span class="bp">None</span><span class="p">):</span>
-        <span class="c1"># Get a single model for a table from a database</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_models</span><span class="p">([</span><span class="n">table_name</span><span class="p">],</span> <span class="n">database_name</span><span class="p">)</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">table_name</span><span class="p">)</span>
-
-    <span class="k">def</span> <span class="nf">__getattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
-        <span class="c1"># Access the tables on an instance of this class</span>
-        <span class="c1"># Do we have a separator defined and is it present in the name?</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">separator</span> <span class="ow">is</span> <span class="ow">not</span> <span class="bp">None</span> <span class="ow">and</span> <span class="n">name</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">separator</span><span class="p">)</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
-            <span class="c1"># We have a database supplied so don&#39;t use the default one</span>
-            <span class="n">database_name</span><span class="p">,</span> <span class="n">name</span> <span class="o">=</span> <span class="n">name</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">separator</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="c1"># Default to non specific database requested</span>
-            <span class="n">database_name</span> <span class="o">=</span> <span class="bp">None</span>
-        <span class="c1"># Get the model for the requested attribute</span>
-        <span class="n">model</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_model</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">database_name</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="bp">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">model</span>
-        <span class="k">if</span> <span class="n">database_name</span> <span class="ow">is</span> <span class="ow">not</span> <span class="bp">None</span><span class="p">:</span>
-            <span class="c1"># Put the name back together for the error we will now raise</span>
-            <span class="n">name</span> <span class="o">=</span> <span class="s1">&#39;{}{}{}&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">database_name</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">separator</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
-        <span class="k">raise</span> <span class="ne">AttributeError</span><span class="p">(</span>
-            <span class="s1">&#39;</span><span class="se">\&#39;</span><span class="s1">{}</span><span class="se">\&#39;</span><span class="s1"> object has no attribute </span><span class="se">\&#39;</span><span class="s1">{}</span><span class="se">\&#39;</span><span class="s1">&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">__class__</span><span class="o">.</span><span class="n">__name__</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
-        <span class="p">)</span>
-</pre></div>
-
-
-<p>It's worth saying that my problems have have been specific to the fact that I was connecting to a MySQL server on a centos box from an OSX laptop. It might also have been hindered by the fact that all of the table names were fully uppercase and had underscores. Or it may of had nothing to do with any of that what so ever.</p>
-<p>The last thing that I found but didn't get too upset about was the fact that any table columns that ended in '_id' had the '_id' striped when it became an attribute on an instance of the model class.</p>
-<h1>SQLSoup</h1>
-<p>My next stop was SQLSoup. It does a fantastic job of sitting on top of SQLAlchemy and providing the dynamic interspection layer that I needed.
-I can't say that I had any problems with this approach what so ever. Except that as time went by and I wanted to do a few more complicated things with the data, I started to lament the fact that I couldn't use a boat load of django apps to help me filter or automatically create an API for example. So I went back to Django to see what I could do.</p>
-<h1>django.db</h1>
-<p>So there I was. I had a working solution with PeeWee and threw it out for SQLSoup. It was also working perfectly but I couldn't leave it alone. I wanted the goodies that come with and are avaialble for Django. So I went digging again. This time with some success.</p>
-<p>Here's what I decided I needed:
-- Be able to specify a new app on the fly. Each app would represent a single database and it's models. NOTE: A single DB, not a single DB server.
-- Be able to specify a new database onfiguration on the fly for each time we add a new app. Each time we connect to a database we want to be able to add it if we haven't already done so.
-- Be able to register models with the new app as we use them.
-- For each of the above, we want to make sure that we only do each once and don't repeat if we have already added a specific App, Database Configuration or Model.</p>
-<div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">django.core.management.commands.inspectdb</span> <span class="kn">import</span> <span class="n">Command</span>
-<span class="kn">from</span> <span class="nn">django.db</span> <span class="kn">import</span> <span class="n">connections</span>
-<span class="kn">from</span> <span class="nn">django.apps</span> <span class="kn">import</span> <span class="n">AppConfig</span>
-<span class="kn">from</span> <span class="nn">django.apps.registry</span> <span class="kn">import</span> <span class="n">apps</span>
 <span class="kn">from</span> <span class="nn">django.db</span> <span class="kn">import</span> <span class="n">models</span>
+<span class="kn">from</span> <span class="nn">jsonfield</span> <span class="kn">import</span> <span class="n">JSONField</span>
+
+
+<span class="k">class</span> <span class="nc">Database</span><span class="p">(</span><span class="n">models</span><span class="o">.</span><span class="n">Model</span><span class="p">):</span>
+    <span class="n">name</span> <span class="o">=</span> <span class="n">models</span><span class="o">.</span><span class="n">CharField</span><span class="p">(</span><span class="n">max_length</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span> <span class="n">unique</span><span class="o">=</span><span class="bp">True</span><span class="p">)</span>
+    <span class="n">config</span> <span class="o">=</span> <span class="n">JSONField</span><span class="p">()</span>
+
+    <span class="k">def</span> <span class="nf">__unicode__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">name</span>
+</pre></div>
+
+
+<p>Simple! We give each a unique name that would usually represent the key in the settings.DATABASES dictionary. The json is what would usually be the value. A dictionary to provide details of the database connection. Host, database name etc.</p>
+<p>Once I had that, I then registered the <code>Database</code> model with the Admin.</p>
+<div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">json</span> <span class="kn">import</span> <span class="n">dumps</span>
+
+<span class="kn">from</span> <span class="nn">django.contrib</span> <span class="kn">import</span> <span class="n">admin</span>
+<span class="kn">from</span> <span class="nn">dynamic_databases.models</span> <span class="kn">import</span> <span class="n">Database</span>
+
+
+<span class="k">def</span> <span class="nf">config</span><span class="p">(</span><span class="n">obj</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">dumps</span><span class="p">(</span><span class="n">obj</span><span class="o">.</span><span class="n">config</span><span class="p">)</span>
+<span class="n">config</span><span class="o">.</span><span class="n">short_description</span> <span class="o">=</span> <span class="s1">&#39;Config&#39;</span>
+
+
+<span class="k">class</span> <span class="nc">DatabaseAdmin</span><span class="p">(</span><span class="n">admin</span><span class="o">.</span><span class="n">ModelAdmin</span><span class="p">):</span>
+    <span class="n">list_display</span> <span class="o">=</span> <span class="p">(</span><span class="s1">&#39;name&#39;</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
+
+
+<span class="n">admin</span><span class="o">.</span><span class="n">site</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">Database</span><span class="p">,</span> <span class="n">DatabaseAdmin</span><span class="p">)</span>
+</pre></div>
+
+
+<p>Again, so far simple enough. We have a model and it's accessible through the admin to add, edit or remove dynamic database references.</p>
+<p>Next up is the ability to register the databases with the running Django instance and to then access the tables of that database as models in Django.</p>
+<p>Firstly I added a method to the <code>Database</code> class that I could call and pass a table name and expect to get back a fully functioning Model class.</p>
+<p>So I added a method called <code>get_model</code> to the <code>Database</code> class and it took one parameter. The name of a table.</p>
+<div class="highlight"><pre><span></span>    <span class="k">def</span> <span class="nf">get_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">table_name</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">register</span><span class="p">()</span>
+        <span class="o">...</span>
+</pre></div>
+
+
+<p>The first thing that it did was call another new method that ensured that the database connection was registered with Django. There's no point in trying to get a model class if we can't connect to the database it resides on. We'll also require a dummy container app for each database connection. Model classes
+need to be registered with an app. So for us we'll have an app per dynamic database. So more than one database can have tables by the same name.</p>
+<div class="highlight"><pre><span></span>    <span class="k">def</span> <span class="nf">register</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># label for the database connection and dummy app</span>
+        <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">label</span>
+        <span class="c1"># Do we have this database registered yet</span>
+        <span class="k">if</span> <span class="n">label</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">connections</span><span class="o">.</span><span class="n">_databases</span><span class="p">:</span>
+            <span class="c1"># Register the database</span>
+            <span class="n">connections</span><span class="o">.</span><span class="n">_databases</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span>
+            <span class="c1"># Break the cached version of the database dict so it&#39;ll find our new database</span>
+            <span class="k">del</span> <span class="n">connections</span><span class="o">.</span><span class="n">databases</span>
+        <span class="c1"># Have we registered our fake app that&#39;ll hold the models for this database</span>
+        <span class="k">if</span> <span class="n">label</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">apps</span><span class="o">.</span><span class="n">app_configs</span><span class="p">:</span>
+            <span class="c1"># We create our own AppConfig class, because the Django one needs a path to the module that is the app.</span>
+            <span class="c1">#Our dummy app obviously doesn&#39;t have a path</span>
+            <span class="n">AppConfig2</span> <span class="o">=</span> <span class="nb">type</span><span class="p">(</span>
+                <span class="s1">&#39;AppConfig&#39;</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s1">&#39;utf8&#39;</span><span class="p">),</span> <span class="p">(</span><span class="n">AppConfig</span><span class="p">,),</span> <span class="p">{</span><span class="s1">&#39;path&#39;</span><span class="p">:</span> <span class="s1">&#39;/tmp/{}&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">label</span><span class="p">)}</span>
+            <span class="p">)</span>
+            <span class="n">app_config</span> <span class="o">=</span> <span class="n">AppConfig2</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
+            <span class="c1"># Manually register the app with the running Django instance</span>
+            <span class="n">apps</span><span class="o">.</span><span class="n">app_configs</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">app_config</span>
+            <span class="n">apps</span><span class="o">.</span><span class="n">app_configs</span><span class="p">[</span><span class="n">label</span><span class="p">]</span><span class="o">.</span><span class="n">models</span> <span class="o">=</span> <span class="p">{}</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span> <span class="nf">label</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># We want to be able to identify the dynamic databases and apps</span>
+        <span class="c1"># So we prepend their names with a common string</span>
+        <span class="n">prefix</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">settings</span><span class="p">,</span> <span class="s1">&#39;DYNAMIC_DATABASES_PREFIX&#39;</span><span class="p">,</span> <span class="s1">&#39;DYNAMIC_DATABASE&#39;</span><span class="p">)</span>
+        <span class="n">separator</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">settings</span><span class="p">,</span> <span class="s1">&#39;DYNAMIC_DATABASES_SEPARATOR&#39;</span><span class="p">,</span> <span class="s1">&#39;_&#39;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="s1">&#39;{}{}{}&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">prefix</span><span class="p">,</span> <span class="n">separator</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">pk</span><span class="p">)</span>
+</pre></div>
+
+
+<p>Now things are starting to take shape. We have the ability to register our database connection and also the app it needs to store the models in.
+Next we need to get the table structure and create a model that represents it.
+It'll then be placed in our dummy app. Lets got back and flesh out our <code>get_model</code> method</p>
+<div class="highlight"><pre><span></span>    <span class="k">def</span> <span class="nf">get_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">table_name</span><span class="p">):</span>
+        <span class="c1"># Ensure the database connect and it&#39;s dummy app are registered</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">register</span><span class="p">()</span>
+        <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">label</span>
+        <span class="n">model_name</span> <span class="o">=</span> <span class="n">table_name</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">,</span> <span class="s1">&#39;&#39;</span><span class="p">)</span>
+
+        <span class="c1"># Is the model already registered with the dummy app?</span>
+        <span class="k">if</span> <span class="n">model_name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">apps</span><span class="o">.</span><span class="n">all_models</span><span class="p">[</span><span class="n">label</span><span class="p">]:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s1">&#39;Adding dynamic model: </span><span class="si">%s</span><span class="s1"> </span><span class="si">%s</span><span class="s1">&#39;</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">table_name</span><span class="p">)</span>
+
+            <span class="c1"># Use the &quot;inspectdb&quot; management command to get the structure of the table for us.</span>
+            <span class="n">file_obj</span> <span class="o">=</span> <span class="n">StringIO</span><span class="p">()</span>
+            <span class="n">Command</span><span class="p">(</span><span class="n">stdout</span><span class="o">=</span><span class="n">file_obj</span><span class="p">)</span><span class="o">.</span><span class="n">handle</span><span class="p">(</span>
+                <span class="n">database</span><span class="o">=</span><span class="n">label</span><span class="p">,</span> <span class="n">table_name_filter</span><span class="o">=</span><span class="k">lambda</span> <span class="n">t</span><span class="p">:</span> <span class="n">t</span> <span class="o">==</span> <span class="n">table_name</span>
+            <span class="p">)</span>
+            <span class="n">model_definition</span> <span class="o">=</span> <span class="n">file_obj</span><span class="o">.</span><span class="n">getvalue</span><span class="p">()</span>
+            <span class="n">file_obj</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+
+            <span class="c1"># Make sure that we found the table and have a model definition</span>
+            <span class="n">loc</span> <span class="o">=</span> <span class="n">model_definition</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="s1">&#39;(models.Model):&#39;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">loc</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+                <span class="c1"># Ensure that the Model has a primary key.</span>
+                <span class="c1"># Django doesn&#39;t support multiple column primary keys,</span>
+                <span class="c1"># So we have to add a primary key if the inspect command didn&#39;t</span>
+                <span class="k">if</span> <span class="n">model_definition</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="s1">&#39;primary_key&#39;</span><span class="p">,</span> <span class="n">loc</span><span class="p">)</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+                    <span class="n">loc</span> <span class="o">=</span> <span class="n">model_definition</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="s1">&#39;(&#39;</span><span class="p">,</span> <span class="n">loc</span> <span class="o">+</span> <span class="mi">14</span><span class="p">)</span>
+                    <span class="n">model_definition</span> <span class="o">=</span> <span class="s1">&#39;{}primary_key=True, {}&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span>
+                        <span class="n">model_definition</span><span class="p">[:</span><span class="n">loc</span> <span class="o">+</span> <span class="mi">1</span><span class="p">],</span> <span class="n">model_definition</span><span class="p">[</span><span class="n">loc</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:]</span>
+                    <span class="p">)</span>
+                <span class="c1"># Ensure that the model specifies what app_label it belongs to</span>
+                <span class="n">loc</span> <span class="o">=</span> <span class="n">model_definition</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="s1">&#39;db_table = </span><span class="se">\&#39;</span><span class="s1">{}</span><span class="se">\&#39;</span><span class="s1">&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">table_name</span><span class="p">))</span>
+                <span class="k">if</span> <span class="n">loc</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+                    <span class="n">model_definition</span> <span class="o">=</span> <span class="s1">&#39;{}app_label = </span><span class="se">\&#39;</span><span class="s1">{}</span><span class="se">\&#39;\n</span><span class="s1">        {}&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span>
+                        <span class="n">model_definition</span><span class="p">[:</span><span class="n">loc</span><span class="p">],</span> <span class="n">label</span><span class="p">,</span> <span class="n">model_definition</span><span class="p">[</span><span class="n">loc</span><span class="p">:]</span>
+                    <span class="p">)</span>
+
+                <span class="c1"># Register the model with Django. Sad day when we use &#39;exec&#39;</span>
+                <span class="k">exec</span><span class="p">(</span><span class="n">model_definition</span><span class="p">,</span> <span class="nb">globals</span><span class="p">(),</span> <span class="nb">locals</span><span class="p">())</span>
+                <span class="c1"># Update the list of models that the app</span>
+                <span class="c1"># has to match what Django now has for this app</span>
+                <span class="n">apps</span><span class="o">.</span><span class="n">app_configs</span><span class="p">[</span><span class="n">label</span><span class="p">]</span><span class="o">.</span><span class="n">models</span> <span class="o">=</span> <span class="n">apps</span><span class="o">.</span><span class="n">all_models</span><span class="p">[</span><span class="n">label</span><span class="p">]</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s1">&#39;Could not find table: </span><span class="si">%s</span><span class="s1"> </span><span class="si">%s</span><span class="s1">&#39;</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">table_name</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s1">&#39;Already added dynamic model: </span><span class="si">%s</span><span class="s1"> </span><span class="si">%s</span><span class="s1">&#39;</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">table_name</span><span class="p">)</span>
+
+        <span class="c1"># If we have the connection, app and model. Return the model class</span>
+        <span class="k">if</span> <span class="p">(</span>
+                <span class="n">label</span> <span class="ow">in</span> <span class="n">connections</span><span class="o">.</span><span class="n">_databases</span> <span class="ow">and</span>
+                <span class="n">label</span> <span class="ow">in</span> <span class="n">apps</span><span class="o">.</span><span class="n">all_models</span> <span class="ow">and</span>
+                <span class="n">model_name</span> <span class="ow">in</span> <span class="n">apps</span><span class="o">.</span><span class="n">all_models</span><span class="p">[</span><span class="n">label</span><span class="p">]</span>
+        <span class="p">):</span>
+            <span class="k">return</span> <span class="n">apps</span><span class="o">.</span><span class="n">get_model</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">model_name</span><span class="p">)</span>
+</pre></div>
+
+
+<p>Just to keep everything above board, here are the imports you'll also need in your <code>models.py</code></p>
+<div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">__future__</span> <span class="kn">import</span> <span class="n">unicode_literals</span>
 
 <span class="kn">from</span> <span class="nn">logging</span> <span class="kn">import</span> <span class="n">getLogger</span>
+<span class="k">try</span><span class="p">:</span>
+    <span class="kn">from</span> <span class="nn">cStringIO</span> <span class="kn">import</span> <span class="n">StringIO</span>
+<span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
+    <span class="kn">from</span> <span class="nn">StringIO</span> <span class="kn">import</span> <span class="n">StringIO</span>
 
+<span class="kn">from</span> <span class="nn">django.core.management.commands.inspectdb</span> <span class="kn">import</span> <span class="n">Command</span>
+<span class="kn">from</span> <span class="nn">django.conf</span> <span class="kn">import</span> <span class="n">settings</span>
+<span class="kn">from</span> <span class="nn">django.db</span> <span class="kn">import</span> <span class="n">models</span><span class="p">,</span> <span class="n">connections</span>
+<span class="kn">from</span> <span class="nn">django.apps</span> <span class="kn">import</span> <span class="n">AppConfig</span>
+<span class="kn">from</span> <span class="nn">django.apps.registry</span> <span class="kn">import</span> <span class="n">apps</span>
 
-<span class="c1"># Each app has an AppConfig.</span>
-<span class="c1"># We need a dummy AppConfig to allow for the fact that we have no physical location.</span>
-<span class="c1"># We can just wrap AppConfig and fake a path with our own AppConfig class.</span>
-<span class="k">class</span> <span class="nc">AppConfig2</span><span class="p">(</span><span class="n">AppConfig</span><span class="p">):</span>
-    <span class="k">def</span> <span class="nf">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">app_name</span><span class="p">,</span> <span class="n">app_module</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">path</span> <span class="o">=</span> <span class="s1">&#39;/tmp/dummy_path&#39;</span>
-        <span class="nb">super</span><span class="p">(</span><span class="n">AppConfig2</span><span class="p">,</span> <span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="n">__init__</span><span class="p">(</span><span class="n">app_name</span><span class="p">,</span> <span class="n">app_module</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">jsonfield</span> <span class="kn">import</span> <span class="n">JSONField</span>
 
-
-<span class="c1"># Main function to get an instance of a model for a specific:</span>
-<span class="c1"># environment, database server, database and table.</span>
-<span class="k">def</span> <span class="nf">get_model</span><span class="p">(</span><span class="n">database_config</span><span class="p">,</span> <span class="n">table</span><span class="p">):</span>
-    <span class="sd">&#39;&#39;&#39;</span>
-<span class="sd">    Terrible voodoo to allow for the ever changing nature of our databases.</span>
-<span class="sd">    We also have to allow for the fact that we have different structures</span>
-<span class="sd">    for the same table name in different environments.</span>
-<span class="sd">    &#39;&#39;&#39;</span>
-
-    <span class="n">environment_name</span> <span class="o">=</span> <span class="n">database_config</span><span class="p">[</span><span class="s1">&#39;environment&#39;</span><span class="p">]</span>
-    <span class="n">database_server_name</span> <span class="o">=</span> <span class="n">database_config</span><span class="p">[</span><span class="s1">&#39;server&#39;</span><span class="p">]</span>
-    <span class="n">database_name</span> <span class="o">=</span> <span class="n">database_config</span><span class="p">[</span><span class="s1">&#39;database&#39;</span><span class="p">]</span>
-
-    <span class="c1"># Create a unique &quot;app_label&quot; name for this env/server/db combo.</span>
-    <span class="c1"># This allows us to have the same table name cached for different combos.</span>
-    <span class="c1"># Which then allows for different structures for the same table.</span>
-    <span class="n">name</span> <span class="o">=</span> <span class="s1">&#39;dynamic_app_{}_{}_{}&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">environment_name</span><span class="p">,</span> <span class="n">database_server_name</span><span class="p">,</span> <span class="n">database_name</span><span class="p">)</span>
-
-    <span class="c1"># Get the list of all database connections django knows about.</span>
-    <span class="n">databases</span> <span class="o">=</span> <span class="n">connections</span><span class="o">.</span><span class="n">databases</span>
-    <span class="c1"># If we haven&#39;t seen this combo before we need to add a new database connection</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">connections</span><span class="o">.</span><span class="n">_databases</span><span class="p">:</span>
-        <span class="c1"># Get the config and insert our connection into django&#39;s list of connections</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s1">&#39;Adding dynamic database connection: </span><span class="si">%s</span><span class="s1">&#39;</span><span class="p">,</span> <span class="n">database_config</span><span class="p">)</span>
-        <span class="n">database</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="s1">&#39;NAME&#39;</span><span class="p">:</span> <span class="n">database_config</span><span class="p">[</span><span class="s1">&#39;database&#39;</span><span class="p">],</span>
-            <span class="s1">&#39;ENGINE&#39;</span><span class="p">:</span> <span class="s1">&#39;django.db.backends.mysql&#39;</span><span class="p">,</span>
-            <span class="s1">&#39;HOST&#39;</span><span class="p">:</span> <span class="n">database_config</span><span class="p">[</span><span class="s1">&#39;host&#39;</span><span class="p">]</span>
-        <span class="p">}</span>
-        <span class="k">if</span> <span class="n">database_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;user&#39;</span><span class="p">):</span>
-            <span class="n">database</span><span class="p">[</span><span class="s1">&#39;USER&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">database_config</span><span class="p">[</span><span class="s1">&#39;user&#39;</span><span class="p">]</span>
-        <span class="k">if</span> <span class="n">database_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;password&#39;</span><span class="p">):</span>
-            <span class="n">database</span><span class="p">[</span><span class="s1">&#39;PASSWORD&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">database_config</span><span class="p">[</span><span class="s1">&#39;password&#39;</span><span class="p">]</span>
-        <span class="n">connections</span><span class="o">.</span><span class="n">_databases</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">database</span>
-        <span class="c1"># Break the cached version of the database dict</span>
-        <span class="k">del</span> <span class="n">connections</span><span class="o">.</span><span class="n">databases</span>
-    <span class="k">else</span><span class="p">:</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s1">&#39;Skipping already registered dynamic database connection: </span><span class="si">%s</span><span class="s1">&#39;</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
-
-    <span class="c1"># If we don&#39;t have the app_label already recorded</span>
-    <span class="c1"># or we don&#39;t already have this table registered to the app_label</span>
-    <span class="c1"># Then we have to create the Model for the table.</span>
-    <span class="k">if</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">apps</span><span class="o">.</span><span class="n">app_configs</span> <span class="ow">or</span> <span class="n">table</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">,</span> <span class="s1">&#39;&#39;</span><span class="p">)</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">apps</span><span class="o">.</span><span class="n">all_models</span><span class="p">[</span><span class="n">name</span><span class="p">]:</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s1">&#39;Adding dynamic model: </span><span class="si">%s</span><span class="s1">&#39;</span><span class="p">,</span> <span class="n">table</span><span class="p">)</span>
-        <span class="c1"># Use the &quot;inspectdb&quot; management command to get the structure of the table for us.</span>
-        <span class="n">file_obj</span> <span class="o">=</span> <span class="n">StringIO</span><span class="p">()</span>
-        <span class="n">Command</span><span class="p">(</span><span class="n">stdout</span><span class="o">=</span><span class="n">file_obj</span><span class="p">)</span><span class="o">.</span><span class="n">handle</span><span class="p">(</span><span class="n">database</span><span class="o">=</span><span class="n">name</span><span class="p">,</span> <span class="n">table_name_filter</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span> <span class="o">==</span> <span class="n">table</span><span class="p">)</span>
-        <span class="n">data</span> <span class="o">=</span> <span class="n">file_obj</span><span class="o">.</span><span class="n">getvalue</span><span class="p">()</span>
-        <span class="n">file_obj</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
-
-        <span class="c1"># Ensure that the Model has a primary key.</span>
-        <span class="c1"># For tables with a combination or more than one we won&#39;t have any.</span>
-        <span class="c1"># We just give it to the first column.</span>
-        <span class="n">loc</span> <span class="o">=</span> <span class="n">data</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="s1">&#39;models.Model):&#39;</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">data</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="s1">&#39;primary_key&#39;</span><span class="p">,</span> <span class="n">loc</span><span class="p">)</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
-            <span class="n">loc</span> <span class="o">=</span> <span class="n">data</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="s1">&#39;(&#39;</span><span class="p">,</span> <span class="n">loc</span> <span class="o">+</span> <span class="mi">14</span><span class="p">)</span>
-            <span class="n">data</span> <span class="o">=</span> <span class="s1">&#39;{}primary_key=True, {}&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">data</span><span class="p">[:</span><span class="n">loc</span> <span class="o">+</span> <span class="mi">1</span><span class="p">],</span> <span class="n">data</span><span class="p">[</span><span class="n">loc</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:])</span>
-
-        <span class="c1"># Ensure that the model specifies what app_label it belongs to</span>
-        <span class="n">loc</span> <span class="o">=</span> <span class="n">data</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="s1">&#39;db_table = </span><span class="se">\&#39;</span><span class="s1">{}</span><span class="se">\&#39;</span><span class="s1">&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">table</span><span class="p">))</span>
-        <span class="n">data</span> <span class="o">=</span> <span class="s1">&#39;{}app_label = </span><span class="se">\&#39;</span><span class="s1">{}</span><span class="se">\&#39;\n</span><span class="s1">        {}&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">data</span><span class="p">[:</span><span class="n">loc</span><span class="p">],</span> <span class="n">name</span><span class="p">,</span> <span class="n">data</span><span class="p">[</span><span class="n">loc</span><span class="p">:])</span>
-
-        <span class="c1"># Nasty!! Exec the model code to create the model class</span>
-        <span class="k">exec</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="nb">globals</span><span class="p">(),</span> <span class="nb">locals</span><span class="p">())</span>
-
-        <span class="c1"># Add the app if it&#39;s not already registered with django</span>
-        <span class="k">if</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">apps</span><span class="o">.</span><span class="n">app_configs</span><span class="p">:</span>
-            <span class="n">app_config</span> <span class="o">=</span> <span class="n">AppConfig2</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
-            <span class="n">apps</span><span class="o">.</span><span class="n">app_configs</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">app_config</span>
-        <span class="c1"># Refresh the models that are registered with the app to match what django has</span>
-        <span class="c1"># since it just registered a new model</span>
-        <span class="n">apps</span><span class="o">.</span><span class="n">app_configs</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">models</span> <span class="o">=</span> <span class="n">apps</span><span class="o">.</span><span class="n">all_models</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
-    <span class="k">else</span><span class="p">:</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s1">&#39;Skipping already registered dynamic model: </span><span class="si">%s</span><span class="s1">&#39;</span><span class="p">,</span> <span class="n">table</span><span class="p">)</span>
-
-    <span class="c1"># Get the model for the table and return it.</span>
-    <span class="n">model</span> <span class="o">=</span> <span class="n">apps</span><span class="o">.</span><span class="n">get_model</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">table</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">,</span> <span class="s1">&#39;&#39;</span><span class="p">))</span>
-    <span class="k">return</span> <span class="n">model</span>
+<span class="n">logger</span> <span class="o">=</span> <span class="n">getLogger</span><span class="p">(</span><span class="s1">&#39;dynamic_databases.models&#39;</span><span class="p">)</span>
 </pre></div>
 
 
-<p>Using the above code I could do the following:</p>
-<div class="highlight"><pre><span></span><span class="n">MyModel</span> <span class="o">=</span> <span class="n">get_model</span><span class="p">(</span>
-    <span class="p">{</span>
-        <span class="s1">&#39;environment&#39;</span><span class="p">:</span> <span class="s1">&#39;production&#39;</span><span class="p">,</span>
-        <span class="s1">&#39;server&#39;</span><span class="p">:</span> <span class="s1">&#39;master&#39;</span><span class="p">,</span>
-        <span class="s1">&#39;database&#39;</span><span class="p">:</span> <span class="s1">&#39;main&#39;</span><span class="p">,</span>
-        <span class="s1">&#39;user&#39;</span><span class="p">:</span> <span class="s1">&#39;user&#39;</span><span class="p">,</span>
-        <span class="s1">&#39;password&#39;</span><span class="p">:</span> <span class="s1">&#39;password&#39;</span><span class="p">,</span>
-        <span class="s1">&#39;host&#39;</span><span class="p">:</span> <span class="s1">&#39;host&#39;</span>
-    <span class="p">},</span>
-    <span class="s1">&#39;table_name&#39;</span>
-<span class="p">)</span>
-<span class="n">results</span> <span class="o">=</span> <span class="n">MyModel</span><span class="o">.</span><span class="n">objects</span><span class="o">.</span><span class="n">filter</span><span class="p">(</span><span class="n">column1__gt</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span><span class="o">.</span><span class="n">order_by</span><span class="p">(</span><span class="s1">&#39;column2&#39;</span><span class="p">)</span>
+<p>Next we need a router in order to tell django what database connection to use for what model classes. I created a <code>router.py</code> file in my <code>dynamic_databases</code> app.</p>
+<div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">django.conf</span> <span class="kn">import</span> <span class="n">settings</span>
+
+
+<span class="k">class</span> <span class="nc">DynamicDatabasesRouter</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+    <span class="c1"># We need to identify our dynamic models</span>
+    <span class="c1"># and point them in the right direction</span>
+    <span class="n">label_prefix</span> <span class="o">=</span> <span class="s1">&#39;{}{}&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span>
+        <span class="nb">getattr</span><span class="p">(</span><span class="n">settings</span><span class="p">,</span> <span class="s1">&#39;DYNAMIC_DATABASES_PREFIX&#39;</span><span class="p">,</span> <span class="s1">&#39;DYNAMIC_DATABASE&#39;</span><span class="p">),</span>
+        <span class="nb">getattr</span><span class="p">(</span><span class="n">settings</span><span class="p">,</span> <span class="s1">&#39;DYNAMIC_DATABASES_SEPARATOR&#39;</span><span class="p">,</span> <span class="s1">&#39;_&#39;</span><span class="p">)</span>
+    <span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">db_for_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="o">**</span><span class="n">hints</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">model</span><span class="o">.</span><span class="n">_meta</span><span class="o">.</span><span class="n">app_label</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">label_prefix</span><span class="p">):</span>
+            <span class="c1"># We know that our app_label matches the database connection&#39;s name</span>
+            <span class="k">return</span> <span class="n">model</span><span class="o">.</span><span class="n">_meta</span><span class="o">.</span><span class="n">app_label</span>
+        <span class="k">return</span> <span class="bp">None</span>
+
+    <span class="k">def</span> <span class="nf">db_for_write</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="o">**</span><span class="n">hints</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">model</span><span class="o">.</span><span class="n">_meta</span><span class="o">.</span><span class="n">app_label</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">label_prefix</span><span class="p">):</span>
+            <span class="c1"># We know that our app_label matches the database connection&#39;s name</span>
+            <span class="k">return</span> <span class="n">model</span><span class="o">.</span><span class="n">_meta</span><span class="o">.</span><span class="n">app_label</span>
+        <span class="k">return</span> <span class="bp">None</span>
+
+    <span class="k">def</span> <span class="nf">allow_relation</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obj1</span><span class="p">,</span> <span class="n">obj2</span><span class="p">,</span> <span class="o">**</span><span class="n">hints</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">None</span>
+
+    <span class="k">def</span> <span class="nf">allow_migrate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">db</span><span class="p">,</span> <span class="n">app_label</span><span class="p">,</span> <span class="n">model_name</span><span class="o">=</span><span class="bp">None</span><span class="p">,</span> <span class="o">**</span><span class="n">hints</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">None</span>
 </pre></div>
 
 
-<p>In reality I have models representing the Environment, Database Server and Database but I broken them out here for simplicity.</p>
-<p>I also haven't dealt with the connection information changing for a specific Environment, Database Server and Database combination.
-I'm sure I could use signals to catch an event like that and unregister the app or model or connection.</p>
+<p>You can register your new router in your settings file with something like the following:</p>
+<div class="highlight"><pre><span></span><span class="n">DATABASE_ROUTERS</span> <span class="o">=</span> <span class="p">[</span><span class="s1">&#39;dynamic_databases.router.DynamicDatabasesRouter&#39;</span><span class="p">]</span>
+</pre></div>
+
+
+<p>At this stage you'd be good to go. Create a database instance and call <code>get_model</code> on it to get a model class that represents a table in your dynamic database connection.</p>
+<p>There is one more thing we can allow for though. What about if a database instance is altered or deleted? Shouldn't we remove the connection, app and models? I think so.</p>
+<p>For this we'll need to listen for some signals and act when we are invoked.
+I created a file called <code>receivers.py</code> in my app. It listened for any save or delete on a Database model instance. It looked like this:</p>
+<div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">django.db.models.signals</span> <span class="kn">import</span> <span class="n">pre_save</span><span class="p">,</span> <span class="n">pre_delete</span>
+<span class="kn">from</span> <span class="nn">django.dispatch</span> <span class="kn">import</span> <span class="n">receiver</span>
+
+<span class="kn">from</span> <span class="nn">dynamic_databases.models</span> <span class="kn">import</span> <span class="n">Database</span>
+
+
+<span class="nd">@receiver</span><span class="p">([</span><span class="n">pre_save</span><span class="p">,</span> <span class="n">pre_delete</span><span class="p">],</span> <span class="n">sender</span><span class="o">=</span><span class="n">Database</span><span class="p">)</span>
+<span class="k">def</span> <span class="nf">unregister_database</span><span class="p">(</span><span class="n">sender</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">if</span> <span class="s1">&#39;instance&#39;</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">:</span>
+        <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;instance&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">unregister</span><span class="p">()</span>
+</pre></div>
+
+
+<p>You'll notice that it's calling a method called <code>unregister</code> that we haven't written yet. So lets. You could probably look at the <code>get_model</code> and <code>register</code> methods and figure out what needs to be undone. Once you have it, you add the method to the <code>Database</code> model class.</p>
+<div class="highlight"><pre><span></span>    <span class="k">def</span> <span class="nf">unregister</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">label</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s1">&#39;Unregistering Database, app and all related models: &quot;</span><span class="si">%s</span><span class="s1">&quot;&#39;</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">apps</span><span class="o">.</span><span class="n">app_configs</span><span class="p">:</span>
+            <span class="k">del</span> <span class="n">apps</span><span class="o">.</span><span class="n">app_configs</span><span class="p">[</span><span class="n">label</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">apps</span><span class="o">.</span><span class="n">all_models</span><span class="p">:</span>
+            <span class="k">del</span> <span class="n">apps</span><span class="o">.</span><span class="n">all_models</span><span class="p">[</span><span class="n">label</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">connections</span><span class="o">.</span><span class="n">_databases</span><span class="p">:</span>
+            <span class="k">del</span> <span class="n">connections</span><span class="o">.</span><span class="n">_databases</span><span class="p">[</span><span class="n">label</span><span class="p">]</span>
+            <span class="k">del</span> <span class="n">connections</span><span class="o">.</span><span class="n">databases</span>
+</pre></div>
+
+
+<p>No we need to make sure that our receiver is registered so it is invoked when the correct changes occur. We can put the import of the receiver in our <code>dynamic_databases</code> <code>apps.py</code> file.</p>
+<div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">__future__</span> <span class="kn">import</span> <span class="n">unicode_literals</span>
+
+<span class="kn">from</span> <span class="nn">django.apps</span> <span class="kn">import</span> <span class="n">AppConfig</span>
+
+
+<span class="k">class</span> <span class="nc">DynamicDatabasesConfig</span><span class="p">(</span><span class="n">AppConfig</span><span class="p">):</span>
+    <span class="n">name</span> <span class="o">=</span> <span class="s1">&#39;dynamic_databases&#39;</span>
+
+    <span class="k">def</span> <span class="nf">ready</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="kn">import</span> <span class="nn">dynamic_databases.receivers</span>
+</pre></div>
+
+
+<p>We also need to register this class so that Django knows that it represents our <code>dynamic_databses</code> app. In the app's <code>__init__.py</code> file we add the following:</p>
+<div class="highlight"><pre><span></span><span class="n">default_app_config</span> <span class="o">=</span> <span class="s1">&#39;dynamic_databases.apps.DynamicDatabasesConfig&#39;</span>
+</pre></div>
+
+
+<p>So there you have it.</p>
+<p>We can</p>
+<ul>
+<li>Store dynamic database connections.</li>
+<li>Add, update and delete through the admin interface.</li>
+<li>Get model classes that represent the tables in the dynamic databases</li>
+<li>We can update the dynamically registered classes as changes are made to our dynamic database model instances.</li>
+<li>We can now try it out...</li>
+</ul>
+<p>I created a test project, added the app and ran the migrations.</p>
+<p>I then created a view to do something very very basic.</p>
+<div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">django.views.generic</span> <span class="kn">import</span> <span class="n">TemplateView</span>
+
+<span class="kn">from</span> <span class="nn">dynamic_databases.models</span> <span class="kn">import</span> <span class="n">Database</span>
+
+
+<span class="k">class</span> <span class="nc">HomeView</span><span class="p">(</span><span class="n">TemplateView</span><span class="p">):</span>
+    <span class="n">template_name</span> <span class="o">=</span> <span class="s1">&#39;home.html&#39;</span>
+
+    <span class="k">def</span> <span class="nf">get_context_data</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">context</span> <span class="o">=</span> <span class="nb">super</span><span class="p">(</span><span class="n">HomeView</span><span class="p">,</span> <span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="n">get_context_data</span><span class="p">()</span>
+
+        <span class="c1"># We can pick which dynamic database connection we want based on a GET parameter</span>
+        <span class="n">db</span> <span class="o">=</span> <span class="n">Database</span><span class="o">.</span><span class="n">objects</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">pk</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">GET</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;env&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+        <span class="c1"># Pass the database instance to the template so we can display it.</span>
+        <span class="n">context</span><span class="p">[</span><span class="s1">&#39;db&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">db</span>
+
+        <span class="c1"># Get a model class for a table in our dynamic database.</span>
+        <span class="c1"># Lets pretend there&#39;s a table called &#39;author&#39;</span>
+        <span class="n">Author</span> <span class="o">=</span> <span class="n">db</span><span class="o">.</span><span class="n">get_model</span><span class="p">(</span><span class="s1">&#39;author&#39;</span><span class="p">)</span>
+        <span class="n">authors</span> <span class="o">=</span> <span class="n">Author</span><span class="o">.</span><span class="n">objects</span><span class="o">.</span><span class="n">all</span><span class="p">()</span><span class="o">.</span><span class="n">order_by</span><span class="p">(</span><span class="s1">&#39;name&#39;</span><span class="p">)</span>
+        <span class="c1"># Send the author instances to the template for iterating over.</span>
+        <span class="n">context</span><span class="p">[</span><span class="s1">&#39;authors&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">authors</span>
+
+        <span class="k">return</span> <span class="n">context</span>
+</pre></div>
+
+
+<p>A simple <code>home.html</code> can go something like this:</p>
+<div class="highlight"><pre><span></span><span class="p">&lt;</span><span class="nt">html</span><span class="p">&gt;</span>
+    <span class="p">&lt;</span><span class="nt">head</span><span class="p">&gt;&lt;/</span><span class="nt">head</span><span class="p">&gt;</span>
+    <span class="p">&lt;</span><span class="nt">body</span><span class="p">&gt;</span>
+        <span class="p">&lt;</span><span class="nt">table</span> <span class="na">border</span><span class="o">=</span><span class="s">&quot;1&quot;</span><span class="p">&gt;</span>
+            <span class="p">&lt;</span><span class="nt">tr</span><span class="p">&gt;</span>
+                <span class="p">&lt;</span><span class="nt">th</span><span class="p">&gt;</span>Name<span class="p">&lt;/</span><span class="nt">th</span><span class="p">&gt;</span>
+                <span class="p">&lt;</span><span class="nt">th</span><span class="p">&gt;</span>Book Count<span class="p">&lt;/</span><span class="nt">th</span><span class="p">&gt;</span>
+            <span class="p">&lt;/</span><span class="nt">tr</span><span class="p">&gt;</span>
+{% for author in authors %}
+            <span class="p">&lt;</span><span class="nt">tr</span><span class="p">&gt;</span>
+                <span class="p">&lt;</span><span class="nt">td</span><span class="p">&gt;</span>{{ author.name }}<span class="p">&lt;/</span><span class="nt">td</span><span class="p">&gt;</span>
+                <span class="p">&lt;</span><span class="nt">td</span><span class="p">&gt;</span>{{ author.book_count }}<span class="p">&lt;/</span><span class="nt">td</span><span class="p">&gt;</span>
+            <span class="p">&lt;/</span><span class="nt">tr</span><span class="p">&gt;</span>
+{% endfor %}
+        <span class="p">&lt;/</span><span class="nt">table</span><span class="p">&gt;</span>
+    <span class="p">&lt;/</span><span class="nt">body</span><span class="p">&gt;</span>
+<span class="p">&lt;/</span><span class="nt">html</span><span class="p">&gt;</span>
+</pre></div>
+
+
+<p>It's important to recognize the limitations here.
+We haven't touched on the fact that there is no <code>ContentType</code> instance that corresponds to our model classes. So a lot of machinery won't work there.
+We could also create an instance of <code>ContentType</code> whenever we add a new model but I haven't gone that far yet. Let me know how you get on, if you give it a whirl.</p>
+<p>Please feel free to ask questions or to tell me that this is flaky and will blow up in my face. It was fun digging into the code and getting it working all the same. Even if it's not recommended for production use because I've missed something fundamental.</p>
+<p>So ultimately, <strong>use at your own risk</strong>.</p>
             </div>
             <!-- /.entry-content -->
     <hr />
